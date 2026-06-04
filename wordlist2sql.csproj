@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <RootNamespace>wordlist2sql</RootNamespace>
+    <AssemblyName>wordlist2sql</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Platforms>AnyCPU;x64</Platforms>
+    <!-- Allow this net8.0 app to run on a newer (9/10/…) Desktop Runtime when
+         no 8.x runtime is present, so the launcher's "8 or newer" check is valid. -->
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <!-- Single-file publish settings. Only active when a RuntimeIdentifier is
+       given (i.e. `dotnet publish -r win-x64`), so plain `dotnet build` stays
+       a normal framework-dependent multi-file build. -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <!-- Bundle native libs (SQLite.Interop.dll) into the exe and extract at run time. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- Compression is only valid for self-contained bundles; skip it when
+         publishing framework-dependent (SelfContained=false). -->
+    <EnableCompressionInSingleFile Condition="'$(SelfContained)' == 'true'">true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Data.SQLite.Core" Version="1.0.119" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Embedded so the form/taskbar can load the full multi-size icon at runtime. -->
+    <EmbeddedResource Include="app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Standalone helpers, not part of the app build:
+         tools/    - icon generator (run manually to regenerate app.ico)
+         launcher/ - separate Native-AOT bootstrapper project -->
+    <Compile Remove="tools/**/*.cs" />
+    <Compile Remove="launcher/**/*.cs" />
+  </ItemGroup>
+
+</Project>
