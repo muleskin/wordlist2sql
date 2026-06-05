@@ -132,16 +132,22 @@ namespace wordlist2sql
 
         private void Handle(HttpListenerContext ctx)
         {
-            string path = Uri.UnescapeDataString(ctx.Request.Url.AbsolutePath).Trim('/');
+            string raw = ctx.Request.Url.AbsolutePath.Trim('/');
 
-            if (string.IsNullOrEmpty(path))
+            if (string.IsNullOrEmpty(raw))
             {
                 WriteIndex(ctx);
                 return;
             }
 
-            string table = WordlistDb.SanitizeTableName(path);
-            ServeTable(ctx, table);
+            // Route:  /table            -> word list  OR  single/all blobs
+            //         /table/<selector> -> a specific blob by name or id
+            int slash = raw.IndexOf('/');
+            string tableSeg = slash >= 0 ? raw.Substring(0, slash) : raw;
+            string selector = slash >= 0 ? Uri.UnescapeDataString(raw.Substring(slash + 1)) : null;
+
+            string table = WordlistDb.SanitizeTableName(Uri.UnescapeDataString(tableSeg));
+            ServeTable(ctx, table, selector);
         }
 
         private void WriteIndex(HttpListenerContext ctx)
@@ -177,7 +183,7 @@ namespace wordlist2sql
             Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET / -> table list");
         }
 
-        private void ServeTable(HttpListenerContext ctx, string table)
+        private void ServeTable(HttpListenerContext ctx, string table, string selector)
         {
             SQLiteConnection conn = null;
             try
@@ -197,37 +203,16 @@ namespace wordlist2sql
                     }
                 }
 
-                // This endpoint streams a one-word-per-line list, so the table
-                // must have a 'word' column. Blob tables don't.
-                if (!HasWordColumn(conn, table))
-                {
+                bool hasWord = HasColumn(conn, table, "word");
+                bool hasData = HasColumn(conn, table, "data");
+
+                if (hasWord)
+                    ServeWords(ctx, conn, table);
+                else if (hasData)
+                    ServeBlob(ctx, conn, table, selector);
+                else
                     WriteStatus(ctx, 400,
-                        $"'{table}' is not a word-list table (no 'word' column); cannot stream as text.\n");
-                    return;
-                }
-
-                ctx.Response.StatusCode = 200;
-                ctx.Response.ContentType = "text/plain; charset=utf-8";
-                ctx.Response.SendChunked = true;
-                ctx.Response.AddHeader("Content-Disposition", $"attachment; filename=\"{table}.txt\"");
-
-                long written = 0;
-                using (var writer = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false), 1 << 20))
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.CommandText = $"SELECT word FROM \"{table.Replace("\"", "\"\"")}\";";
-                    using (var r = cmd.ExecuteReader())
-                    {
-                        while (r.Read())
-                        {
-                            if (!r.IsDBNull(0))
-                                writer.WriteLine(r.GetString(0));
-                            written++;
-                        }
-                    }
-                }
-
-                Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET /{table} -> {written:n0} words");
+                        $"'{table}' has no 'word' or 'data' column; don't know how to serve it.\n");
             }
             catch (HttpListenerException)
             {
@@ -237,6 +222,182 @@ namespace wordlist2sql
             {
                 try { ctx.Response.OutputStream.Close(); } catch { }
                 conn?.Dispose();
+            }
+        }
+
+        private void ServeWords(HttpListenerContext ctx, SQLiteConnection conn, string table)
+        {
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/plain; charset=utf-8";
+            ctx.Response.SendChunked = true;
+            ctx.Response.AddHeader("Content-Disposition", $"attachment; filename=\"{table}.txt\"");
+
+            long written = 0;
+            using (var writer = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false), 1 << 20))
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT word FROM {Quote(table)};";
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        if (!r.IsDBNull(0))
+                            writer.WriteLine(r.GetString(0));
+                        written++;
+                    }
+                }
+            }
+            Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET /{table} -> {written:n0} words");
+        }
+
+        /// <summary>
+        /// Serve binary content from a blob table.
+        ///  - /table            : the single blob (or a listing if there are many)
+        ///  - /table/&lt;name&gt;   : the blob whose stored file name matches
+        ///  - /table/&lt;id&gt;     : the blob with that row id
+        /// </summary>
+        private void ServeBlob(HttpListenerContext ctx, SQLiteConnection conn, string table, string selector)
+        {
+            string where;
+            object key;
+
+            if (!string.IsNullOrEmpty(selector))
+            {
+                // Numeric selector -> row id; otherwise match the stored name.
+                if (long.TryParse(selector, out long id))
+                {
+                    where = "id = @k";
+                    key = id;
+                }
+                else
+                {
+                    where = "name = @k";
+                    key = selector;
+                }
+            }
+            else
+            {
+                // No selector: if exactly one blob, serve it; otherwise list them.
+                long count;
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = $"SELECT COUNT(*) FROM {Quote(table)};";
+                    count = Convert.ToInt64(cmd.ExecuteScalar());
+                }
+
+                if (count == 0)
+                {
+                    WriteStatus(ctx, 404, $"'{table}' contains no blobs.\n");
+                    return;
+                }
+                if (count > 1)
+                {
+                    WriteBlobListing(ctx, conn, table);
+                    return;
+                }
+
+                where = "1=1"; // the only row
+                key = null;
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                // length() first so we can set Content-Length, then stream data.
+                cmd.CommandText =
+                    $"SELECT name, length(data), data FROM {Quote(table)} WHERE {where} LIMIT 1;";
+                if (key != null) cmd.Parameters.AddWithValue("@k", key);
+
+                using (var r = cmd.ExecuteReader(System.Data.CommandBehavior.SequentialAccess))
+                {
+                    if (!r.Read())
+                    {
+                        WriteStatus(ctx, 404, $"no blob '{selector}' in '{table}'.\n");
+                        return;
+                    }
+
+                    string name = r.IsDBNull(0) ? table + ".bin" : r.GetString(0);
+                    long len = r.IsDBNull(1) ? 0 : r.GetInt64(1);
+
+                    ctx.Response.StatusCode = 200;
+                    ctx.Response.ContentType = ContentTypeFor(name);
+                    ctx.Response.ContentLength64 = len;
+                    ctx.Response.AddHeader("Content-Disposition",
+                        $"attachment; filename=\"{SanitizeHeader(name)}\"");
+
+                    // Stream the BLOB column in chunks (no full-file buffering).
+                    var outStream = ctx.Response.OutputStream;
+                    byte[] buffer = new byte[1 << 16];
+                    long offset = 0;
+                    while (true)
+                    {
+                        long read = r.GetBytes(2, offset, buffer, 0, buffer.Length);
+                        if (read <= 0) break;
+                        outStream.Write(buffer, 0, (int)read);
+                        offset += read;
+                        if (read < buffer.Length) break;
+                    }
+
+                    Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET /{table}" +
+                                (selector != null ? "/" + selector : "") +
+                                $" -> blob '{name}' ({offset:n0} bytes)");
+                }
+            }
+        }
+
+        private void WriteBlobListing(HttpListenerContext ctx, SQLiteConnection conn, string table)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"# '{table}' contains multiple blobs. Fetch one with:");
+            sb.AppendLine($"#   curl http://localhost:{_port}/{table}/<name>   (or /<id>)");
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT id, name, length(data) FROM {Quote(table)} ORDER BY id;";
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        long id = r.GetInt64(0);
+                        string name = r.IsDBNull(1) ? "" : r.GetString(1);
+                        long len = r.IsDBNull(2) ? 0 : r.GetInt64(2);
+                        sb.AppendLine($"{id}\t{len}\t{name}");
+                    }
+                }
+            }
+            WriteStatus(ctx, 200, sb.ToString());
+        }
+
+        private static string Quote(string ident) => "\"" + ident.Replace("\"", "\"\"") + "\"";
+
+        private static string SanitizeHeader(string name)
+        {
+            // Keep the filename header on one safe line.
+            return name.Replace("\"", "'").Replace("\r", "").Replace("\n", "");
+        }
+
+        private static string ContentTypeFor(string name)
+        {
+            string ext = "";
+            int dot = name.LastIndexOf('.');
+            if (dot >= 0) ext = name.Substring(dot).ToLowerInvariant();
+            switch (ext)
+            {
+                case ".png": return "image/png";
+                case ".jpg": case ".jpeg": return "image/jpeg";
+                case ".gif": return "image/gif";
+                case ".bmp": return "image/bmp";
+                case ".webp": return "image/webp";
+                case ".svg": return "image/svg+xml";
+                case ".pdf": return "application/pdf";
+                case ".zip": return "application/zip";
+                case ".gz": return "application/gzip";
+                case ".json": return "application/json";
+                case ".xml": return "application/xml";
+                case ".txt": case ".log": case ".csv": return "text/plain; charset=utf-8";
+                case ".html": case ".htm": return "text/html; charset=utf-8";
+                case ".mp4": return "video/mp4";
+                case ".mp3": return "audio/mpeg";
+                case ".wav": return "audio/wav";
+                default: return "application/octet-stream";
             }
         }
 
@@ -250,15 +411,15 @@ namespace wordlist2sql
             ctx.Response.OutputStream.Close();
         }
 
-        private static bool HasWordColumn(SQLiteConnection conn, string table)
+        private static bool HasColumn(SQLiteConnection conn, string table, string column)
         {
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = $"PRAGMA table_info(\"{table.Replace("\"", "\"\"")}\");";
+                cmd.CommandText = $"PRAGMA table_info({Quote(table)});";
                 using (var r = cmd.ExecuteReader())
                 {
                     while (r.Read())
-                        if (string.Equals(r.GetString(1), "word", StringComparison.OrdinalIgnoreCase))
+                        if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase))
                             return true;
                 }
             }

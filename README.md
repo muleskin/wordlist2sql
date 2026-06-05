@@ -120,10 +120,22 @@ cached copy (keyed by content hash, so a new build re-extracts automatically).
 4. Select a table and **Export…** — word tables write back to a `.txt`; BLOB tables
    extract every stored file into a folder you pick (original names, de-duplicated
    on collision).
-5. Set a **port** and **Start server** to expose word tables over HTTP for `curl`.
+5. Set a **port** and **Start server** to expose tables over HTTP for `curl`.
 
-Tables are tagged **words** or **blobs** in the list. Word-only features (search,
-text export, the HTTP server) automatically skip blob tables.
+Tables are tagged **words** or **blobs** in the list. Search and text export apply
+to word tables only. The HTTP server serves both:
+
+```
+curl http://localhost:8088/                 # list tables
+curl http://localhost:8088/mywords -o w.txt # word table -> text, one per line
+curl http://localhost:8088/assets  -o f.png # blob table with one file -> the bytes
+curl http://localhost:8088/assets           # blob table with many -> a listing
+curl http://localhost:8088/assets/logo.png -o logo.png   # a blob by file name
+curl http://localhost:8088/assets/3        -o file3      # a blob by row id
+```
+
+Blob responses carry the stored file name (`Content-Disposition`) and a guessed
+`Content-Type`, and stream in chunks so large files don't buffer in memory.
 
 ## Performance notes
 
