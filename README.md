@@ -75,46 +75,55 @@ download link on launch.
 Compression is applied automatically to the self-contained build only (it isn't
 supported for framework-dependent single files).
 
-### Recommended: small app + self-installing launcher
+### Recommended: one self-installing single file
 
-The best of both worlds — a small download that still "just works" on a PC without
-the runtime. A tiny **Native-AOT bootstrapper** (`launcher/`) ships next to the
-framework-dependent app. Being AOT-compiled it has *no* .NET dependency itself, so
-it always runs; on launch it:
+The best of both worlds — a small **single** exe that still "just works" on a PC
+without the runtime. A **Native-AOT bootstrapper** (`launcher/`) has the
+framework-dependent app **embedded inside it**. Being AOT-compiled the bootstrapper
+has *no* .NET dependency of its own, so it always runs; on launch it:
 
-1. checks whether the **.NET 8+ Desktop Runtime** is installed,
-2. if not, offers to download it from Microsoft's official link and installs it
+1. extracts the embedded app to a per-version cache
+   (`%LOCALAPPDATA%\wordlist2sql\app\<hash>\`),
+2. checks whether the **.NET 8+ Desktop Runtime** is installed,
+3. if not, offers to download it from Microsoft's official link and installs it
    (passive UI, auto-elevates via UAC), then
-3. starts `wordlist2sql.exe`.
+4. starts the extracted app.
 
-Build the whole distributable with one command:
+Build it with one command:
 
 ```powershell
 .\build-dist.ps1            # -Rid win-x86 for 32-bit
 ```
 
-Output is `dist\` with two files (~8.6 MB total):
+Output: **`dist\wordlist2sql.exe`** — one file, ~8.6 MB. Ship just that. The
+embedded app sets `RollForward=Major`, so it runs on the .NET 8, 9, or 10 Desktop
+Runtime — whichever is present.
 
-| File | What it is |
-|------|------------|
-| `wordlist2sql-launcher.exe` | Native AOT bootstrapper — **this is what users run** |
-| `wordlist2sql.exe` | The framework-dependent app it launches |
-
-Ship both together. The app sets `RollForward=Major`, so it runs on the .NET 8, 9,
-or 10 Desktop Runtime — whichever is present.
+How it's assembled: `build-dist.ps1` publishes the framework-dependent app, stages
+it as `launcher\embedded\app.exe`, then AOT-publishes the launcher which embeds that
+payload as a resource. The first launch extracts once; later launches reuse the
+cached copy (keyed by content hash, so a new build re-extracts automatically).
 
 > **Build requirement:** the AOT launcher needs the Visual Studio **"Desktop
 > development with C++"** workload (MSVC linker). `build-dist.ps1` locates it via
-> `vswhere` and imports the VC environment automatically. The framework-dependent
-> app alone does not need C++ tools.
+> `vswhere` and imports the VC environment automatically. The other build variants
+> do not need C++ tools.
 
 ## How to use
 
-1. **Open / Create…** — choose where the `.db` file lives (created if missing).
-2. **Import wordlist file(s)…** — pick one or more `.txt` files; each becomes a table.
-   Tick *De-duplicate* first if you want unique words only.
-3. Select a table and **Export to file…** to write it back out.
-4. Set a **port** and **Start server** to expose tables over HTTP for `curl`.
+1. **Open…** — choose where the `.db` file lives (typing a new name creates it).
+2. **Import wordlist file(s)…** — pick one or more `.txt` files; each becomes a
+   word table. Tick *De-duplicate* first if you want unique words only.
+3. **Import file(s) as BLOBs…** — store whole binary files (images, archives,
+   anything) as rows in a single table you name. Choose *append* or *replace* if
+   the table already exists.
+4. Select a table and **Export…** — word tables write back to a `.txt`; BLOB tables
+   extract every stored file into a folder you pick (original names, de-duplicated
+   on collision).
+5. Set a **port** and **Start server** to expose word tables over HTTP for `curl`.
+
+Tables are tagged **words** or **blobs** in the list. Word-only features (search,
+text export, the HTTP server) automatically skip blob tables.
 
 ## Performance notes
 

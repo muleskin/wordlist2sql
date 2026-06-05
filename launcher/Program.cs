@@ -2,22 +2,27 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 
 namespace wordlist2sql_launcher
 {
     /// <summary>
-    /// Native-AOT bootstrapper for wordlist2sql.
+    /// Native-AOT bootstrapper for wordlist2sql, shipped as a SINGLE file.
     ///
-    /// Because it is AOT-compiled it has no .NET runtime dependency of its own,
-    /// so it can run on a machine where the runtime is missing. It:
-    ///   1. checks whether the .NET 8+ Desktop Runtime is installed,
-    ///   2. if not, offers to download and install it from Microsoft, then
-    ///   3. launches the framework-dependent wordlist2sql.exe.
+    /// The framework-dependent app is embedded inside this exe as a resource.
+    /// Because the launcher is AOT-compiled it has no .NET runtime dependency of
+    /// its own, so it can run on a machine where the runtime is missing. It:
+    ///   1. extracts the embedded app to a per-version cache folder,
+    ///   2. checks whether the .NET 8+ Desktop Runtime is installed,
+    ///   3. if not, offers to download and install it from Microsoft, then
+    ///   4. launches the extracted wordlist2sql.exe.
     /// </summary>
     internal static class Program
     {
+        private const string PayloadResource = "AppPayload";
         private const string AppExe = "wordlist2sql.exe";
         private const int RequiredMajor = 8;
 
@@ -39,16 +44,29 @@ namespace wordlist2sql_launcher
 
         private static int Main(string[] args)
         {
-            string baseDir = AppContext.BaseDirectory;
-            string appPath = Path.Combine(baseDir, AppExe);
-
-            if (!File.Exists(appPath))
+            // 1. Unpack the embedded app to a per-version cache folder.
+            string appPath;
+            try
+            {
+                appPath = ExtractEmbeddedApp();
+            }
+            catch (Exception ex)
             {
                 MessageBoxW(IntPtr.Zero,
-                    $"Could not find {AppExe} next to this launcher.\n\nExpected at:\n{appPath}",
+                    "Could not unpack the application payload:\n\n" + ex.Message,
                     Caption, MB_OK | MB_ICONERROR);
                 return 1;
             }
+
+            if (appPath == null)
+            {
+                MessageBoxW(IntPtr.Zero,
+                    "This launcher was built without an embedded application payload.",
+                    Caption, MB_OK | MB_ICONERROR);
+                return 1;
+            }
+
+            string baseDir = Path.GetDirectoryName(appPath);
 
             if (!DesktopRuntimeInstalled())
             {
@@ -93,6 +111,64 @@ namespace wordlist2sql_launcher
                 MessageBoxW(IntPtr.Zero, "Failed to start wordlist2sql:\n\n" + ex.Message,
                     Caption, MB_OK | MB_ICONERROR);
                 return 5;
+            }
+        }
+
+        /// <summary>
+        /// Write the embedded app payload to a cache folder keyed by its content
+        /// hash, so each build extracts once and is reused thereafter. Returns the
+        /// path to the extracted exe, or null if no payload was embedded.
+        /// </summary>
+        private static string ExtractEmbeddedApp()
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            using (var res = asm.GetManifestResourceStream(PayloadResource))
+            {
+                if (res == null)
+                    return null;
+
+                byte[] payload;
+                using (var ms = new MemoryStream())
+                {
+                    res.CopyTo(ms);
+                    payload = ms.ToArray();
+                }
+
+                // Short content hash -> stable, collision-free per-version folder.
+                string tag;
+                using (var sha = SHA256.Create())
+                {
+                    byte[] h = sha.ComputeHash(payload);
+                    tag = Convert.ToHexString(h, 0, 8).ToLowerInvariant();
+                }
+
+                string cacheRoot = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "wordlist2sql", "app", tag);
+                Directory.CreateDirectory(cacheRoot);
+
+                string exePath = Path.Combine(cacheRoot, AppExe);
+
+                // Reuse if already extracted and the size matches (cheap integrity check).
+                if (File.Exists(exePath) && new FileInfo(exePath).Length == payload.Length)
+                    return exePath;
+
+                // Write atomically: temp file in the same folder, then move into place.
+                string tmp = exePath + "." + Environment.ProcessId + ".tmp";
+                File.WriteAllBytes(tmp, payload);
+                try
+                {
+                    File.Move(tmp, exePath, overwrite: true);
+                }
+                catch (IOException)
+                {
+                    // Another instance won the race, or the target is in use but
+                    // already the right size — fall back to whatever is there.
+                    try { File.Delete(tmp); } catch { }
+                    if (!File.Exists(exePath))
+                        throw;
+                }
+                return exePath;
             }
         }
 

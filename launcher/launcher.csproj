@@ -5,7 +5,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
-    <AssemblyName>wordlist2sql-launcher</AssemblyName>
+    <!-- The launcher IS the shipped single file, so it takes the app's name. -->
+    <AssemblyName>wordlist2sql</AssemblyName>
     <RootNamespace>wordlist2sql_launcher</RootNamespace>
 
     <!-- Native AOT: produces a standalone native exe with NO .NET dependency,
@@ -17,5 +18,14 @@
     <DebugSymbols>false</DebugSymbols>
     <Platforms>x64</Platforms>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The framework-dependent app, embedded as a payload. build-dist.ps1 stages
+         it here before publishing. The Condition lets a plain `dotnet build`
+         succeed even when the payload hasn't been staged yet. -->
+    <EmbeddedResource Include="embedded\app.exe" Condition="Exists('embedded\app.exe')">
+      <LogicalName>AppPayload</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
 
 </Project>

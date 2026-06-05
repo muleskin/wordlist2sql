@@ -76,7 +76,30 @@ namespace wordlist2sql
                 "source_file TEXT," +
                 "deduped INTEGER NOT NULL DEFAULT 0," +
                 "imported_utc TEXT NOT NULL);");
+
+            // Migration: older databases lack the 'kind' column. Add it if missing.
+            if (!MetaHasColumn("kind"))
+                Exec(_conn, $"ALTER TABLE \"{MetaTable}\" ADD COLUMN kind TEXT NOT NULL DEFAULT 'words';");
         }
+
+        private bool MetaHasColumn(string column)
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = $"PRAGMA table_info(\"{MetaTable}\");";
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                        if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>'words' (one-per-line list) or 'blobs' (binary files).</summary>
+        public const string KindWords = "words";
+        public const string KindBlobs = "blobs";
 
         // ---- Table identifier handling -------------------------------------
 
@@ -122,10 +145,11 @@ namespace wordlist2sql
         public sealed class TableInfo
         {
             public string Name;
-            public long WordCount;
+            public long WordCount;       // for blob tables: number of files
             public string SourceFile;
             public bool Deduped;
             public string ImportedUtc;
+            public string Kind = KindWords;
         }
 
         /// <summary>List user wordlist tables with metadata (cheap, no scans).</summary>
@@ -138,7 +162,7 @@ namespace wordlist2sql
             using (var cmd = _conn.CreateCommand())
             {
                 cmd.CommandText =
-                    $"SELECT table_name, word_count, source_file, deduped, imported_utc FROM \"{MetaTable}\";";
+                    $"SELECT table_name, word_count, source_file, deduped, imported_utc, kind FROM \"{MetaTable}\";";
                 using (var r = cmd.ExecuteReader())
                 {
                     while (r.Read())
@@ -150,6 +174,7 @@ namespace wordlist2sql
                             SourceFile = r.IsDBNull(2) ? "" : r.GetString(2),
                             Deduped = r.GetInt64(3) != 0,
                             ImportedUtc = r.IsDBNull(4) ? "" : r.GetString(4),
+                            Kind = r.IsDBNull(5) ? KindWords : r.GetString(5),
                         };
                         meta[ti.Name] = ti;
                     }
@@ -292,7 +317,7 @@ namespace wordlist2sql
                 }
             }
 
-            UpsertMeta(tableName, inserted, filePath, dedupe);
+            UpsertMeta(tableName, inserted, filePath, dedupe, KindWords);
 
             prog.BytesRead = totalBytes;
             prog.WordsInserted = inserted;
@@ -302,23 +327,180 @@ namespace wordlist2sql
             return new ImportResult { WordsInserted = inserted, LinesRead = lines, Deduped = dedupe };
         }
 
-        private void UpsertMeta(string tableName, long count, string sourceFile, bool dedupe)
+        private void UpsertMeta(string tableName, long count, string sourceFile, bool dedupe, string kind)
         {
             using (var cmd = _conn.CreateCommand())
             {
                 cmd.CommandText =
-                    $"INSERT INTO \"{MetaTable}\" (table_name, word_count, source_file, deduped, imported_utc) " +
-                    "VALUES (@t, @c, @s, @d, @u) " +
+                    $"INSERT INTO \"{MetaTable}\" (table_name, word_count, source_file, deduped, imported_utc, kind) " +
+                    "VALUES (@t, @c, @s, @d, @u, @k) " +
                     "ON CONFLICT(table_name) DO UPDATE SET " +
-                    "word_count=@c, source_file=@s, deduped=@d, imported_utc=@u;";
+                    "word_count=@c, source_file=@s, deduped=@d, imported_utc=@u, kind=@k;";
                 cmd.Parameters.AddWithValue("@t", tableName);
                 cmd.Parameters.AddWithValue("@c", count);
                 cmd.Parameters.AddWithValue("@s", sourceFile ?? "");
                 cmd.Parameters.AddWithValue("@d", dedupe ? 1 : 0);
                 cmd.Parameters.AddWithValue("@u", DateTime.UtcNow.ToString("o"));
+                cmd.Parameters.AddWithValue("@k", kind ?? KindWords);
                 cmd.ExecuteNonQuery();
             }
         }
+
+        // ---- Blob import / export ------------------------------------------
+
+        public sealed class BlobProgress
+        {
+            public int FilesDone;
+            public int TotalFiles;
+            public string CurrentFile;
+            public long BytesDone;
+        }
+
+        /// <summary>
+        /// Import one or more files as BLOB rows in <paramref name="tableName"/>.
+        /// If <paramref name="append"/> is false the table is replaced; otherwise
+        /// rows are added to an existing blob table.
+        /// Schema: (id, name, ext, size, data, imported_utc).
+        /// </summary>
+        public int ImportBlobs(
+            string tableName,
+            IReadOnlyList<string> filePaths,
+            bool append,
+            IProgress<BlobProgress> progress,
+            CancellationToken ct)
+        {
+            if (!append || !TableExists(tableName))
+            {
+                DropTable(tableName);
+                Exec(_conn,
+                    $"CREATE TABLE {Q(tableName)} (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+                    "name TEXT NOT NULL," +
+                    "ext TEXT," +
+                    "size INTEGER NOT NULL," +
+                    "data BLOB NOT NULL," +
+                    "imported_utc TEXT NOT NULL);");
+            }
+
+            var prog = new BlobProgress { TotalFiles = filePaths.Count };
+            int done = 0;
+            string nowUtc = DateTime.UtcNow.ToString("o");
+
+            using (var tx = _conn.BeginTransaction())
+            {
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText =
+                        $"INSERT INTO {Q(tableName)} (name, ext, size, data, imported_utc) " +
+                        "VALUES (@n, @e, @s, @d, @u);";
+                    var pn = cmd.Parameters.Add("@n", DbTypeText());
+                    var pe = cmd.Parameters.Add("@e", DbTypeText());
+                    var ps = cmd.Parameters.Add("@s", DbTypeInt());
+                    var pd = cmd.Parameters.Add("@d", DbTypeBlob());
+                    var pu = cmd.Parameters.Add("@u", DbTypeText());
+
+                    foreach (string path in filePaths)
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        byte[] bytes = File.ReadAllBytes(path);
+                        pn.Value = Path.GetFileName(path);
+                        string ext = Path.GetExtension(path);
+                        pe.Value = string.IsNullOrEmpty(ext) ? (object)DBNull.Value : ext;
+                        ps.Value = (long)bytes.Length;
+                        pd.Value = bytes;
+                        pu.Value = nowUtc;
+                        cmd.ExecuteNonQuery();
+
+                        done++;
+                        prog.FilesDone = done;
+                        prog.CurrentFile = Path.GetFileName(path);
+                        prog.BytesDone += bytes.Length;
+                        progress?.Report(prog);
+                    }
+                }
+                tx.Commit();
+            }
+
+            long totalRows = TryGetRowCount(tableName);
+            UpsertMeta(tableName, totalRows,
+                filePaths.Count == 1 ? filePaths[0] : $"{filePaths.Count} files",
+                false, KindBlobs);
+
+            return done;
+        }
+
+        /// <summary>
+        /// Extract every BLOB in a blob table to <paramref name="destFolder"/>,
+        /// using the stored file names (de-duplicating on collision). Returns the
+        /// number of files written.
+        /// </summary>
+        public int ExportBlobs(
+            string tableName,
+            string destFolder,
+            IProgress<BlobProgress> progress,
+            CancellationToken ct)
+        {
+            Directory.CreateDirectory(destFolder);
+            var prog = new BlobProgress { TotalFiles = (int)TryGetRowCount(tableName) };
+            int written = 0;
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT name, data FROM {Q(tableName)} ORDER BY id;";
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        string name = r.IsDBNull(0) ? "blob" : r.GetString(0);
+                        name = SafeFileName(name);
+
+                        // Avoid overwriting same-named files.
+                        string candidate = name;
+                        int n = 1;
+                        while (!used.Add(candidate.ToLowerInvariant()))
+                        {
+                            string stem = Path.GetFileNameWithoutExtension(name);
+                            string ext = Path.GetExtension(name);
+                            candidate = $"{stem} ({n++}){ext}";
+                        }
+
+                        byte[] data = (byte[])r.GetValue(1);
+                        File.WriteAllBytes(Path.Combine(destFolder, candidate), data);
+
+                        written++;
+                        prog.FilesDone = written;
+                        prog.CurrentFile = candidate;
+                        prog.BytesDone += data.Length;
+                        progress?.Report(prog);
+                    }
+                }
+            }
+            return written;
+        }
+
+        private static string SafeFileName(string name)
+        {
+            foreach (char c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return string.IsNullOrWhiteSpace(name) ? "blob" : name;
+        }
+
+        public long TryGetRowCount(string tableName)
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT COUNT(*) FROM {Q(tableName)};";
+                return Convert.ToInt64(cmd.ExecuteScalar());
+            }
+        }
+
+        private static System.Data.DbType DbTypeText() => System.Data.DbType.String;
+        private static System.Data.DbType DbTypeInt() => System.Data.DbType.Int64;
+        private static System.Data.DbType DbTypeBlob() => System.Data.DbType.Binary;
 
         // ---- Export --------------------------------------------------------
 
@@ -438,7 +620,8 @@ namespace wordlist2sql
                     : "word = @w";
             }
 
-            var tables = ListTables();
+            // Only word tables have a 'word' column; blob tables are skipped.
+            var tables = ListTables().FindAll(t => t.Kind == KindWords);
             result.TablesSearched = tables.Count;
 
             foreach (var t in tables)

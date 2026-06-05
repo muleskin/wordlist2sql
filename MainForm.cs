@@ -24,6 +24,7 @@ namespace wordlist2sql
         private Button _dropBtn;
         private Button _importBtn;
         private CheckBox _dedupeChk;
+        private Button _importBlobsBtn;
         private Button _exportBtn;
         private TextBox _searchBox;
         private CheckBox _revealChk;
@@ -90,11 +91,12 @@ namespace wordlist2sql
                 MultiSelect = false,
                 HideSelection = false,
             };
-            _tablesView.Columns.Add("Table", 200);
-            _tablesView.Columns.Add("Words", 110, HorizontalAlignment.Right);
-            _tablesView.Columns.Add("Unique", 70);
-            _tablesView.Columns.Add("Source file", 260);
-            _tablesView.Columns.Add("Imported (UTC)", 170);
+            _tablesView.Columns.Add("Table", 180);
+            _tablesView.Columns.Add("Kind", 55);
+            _tablesView.Columns.Add("Rows", 100, HorizontalAlignment.Right);
+            _tablesView.Columns.Add("Unique", 60);
+            _tablesView.Columns.Add("Source", 240);
+            _tablesView.Columns.Add("Imported (UTC)", 160);
             _tablesView.SelectedIndexChanged += (s, e) => UpdateEnabled();
 
             var tablesButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, FlowDirection = FlowDirection.LeftToRight };
@@ -120,15 +122,18 @@ namespace wordlist2sql
             _importBtn = new Button { Text = "Import wordlist file(s)…", Width = 180, Height = 30 };
             _importBtn.Click += OnImport;
             _dedupeChk = new CheckBox { Text = "De-duplicate (unique words only)", AutoSize = true, Margin = new Padding(16, 8, 0, 0) };
+            _importBlobsBtn = new Button { Text = "Import file(s) as BLOBs…", Width = 175, Height = 30, Margin = new Padding(24, 0, 0, 0) };
+            _importBlobsBtn.Click += OnImportBlobs;
             var importHint = new Label
             {
-                Text = "Each file becomes its own table (named after the file).",
+                Text = "Wordlists: one table per file. BLOBs: store whole files in one table.",
                 AutoSize = true,
                 ForeColor = SystemColors.GrayText,
                 Margin = new Padding(16, 9, 0, 0)
             };
             importInner.Controls.Add(_importBtn);
             importInner.Controls.Add(_dedupeChk);
+            importInner.Controls.Add(_importBlobsBtn);
             importInner.Controls.Add(importHint);
             importGroup.Controls.Add(importInner);
 
@@ -228,10 +233,13 @@ namespace wordlist2sql
 
             _openDbBtn.Enabled = idle;
             _importBtn.Enabled = hasDb && idle;
+            _importBlobsBtn.Enabled = hasDb && idle;
             _refreshBtn.Enabled = hasDb && idle;
             _renameBtn.Enabled = hasDb && hasSel && idle;
             _dropBtn.Enabled = hasDb && hasSel && idle;
             _exportBtn.Enabled = hasDb && hasSel && idle;
+            // Reflect what export will do for the selected table.
+            _exportBtn.Text = SelectedIsBlobTable() ? "Export BLOBs…" : "Export to file…";
             _serverBtn.Enabled = hasDb;
             _dedupeChk.Enabled = hasDb && idle;
             _searchBox.Enabled = hasDb && idle;
@@ -243,15 +251,22 @@ namespace wordlist2sql
         private string SelectedTable()
             => _tablesView.SelectedItems.Count > 0 ? _tablesView.SelectedItems[0].Text : null;
 
+        private bool SelectedIsBlobTable()
+            => _tablesView != null && _tablesView.SelectedItems.Count > 0
+               && (_tablesView.SelectedItems[0].Tag as string) == WordlistDb.KindBlobs;
+
         // -------------------------------------------------------- DB actions
 
         private void OnOpenDb(object sender, EventArgs e)
         {
-            using (var dlg = new SaveFileDialog
+            // OpenFileDialog (button reads "Open"); CheckFileExists=false still
+            // allows typing a new filename to create a database.
+            using (var dlg = new OpenFileDialog
             {
                 Title = "Open or create a SQLite database",
                 Filter = "SQLite database (*.db;*.sqlite)|*.db;*.sqlite|All files (*.*)|*.*",
-                OverwritePrompt = false,
+                CheckFileExists = false,
+                CheckPathExists = true,
                 FileName = "wordlists.db",
             })
             {
@@ -284,11 +299,14 @@ namespace wordlist2sql
             {
                 foreach (var t in _db.ListTables())
                 {
+                    bool blobs = t.Kind == WordlistDb.KindBlobs;
                     var item = new ListViewItem(t.Name);
+                    item.SubItems.Add(blobs ? "blobs" : "words");
                     item.SubItems.Add(t.WordCount >= 0 ? t.WordCount.ToString("n0") : "?");
-                    item.SubItems.Add(t.WordCount >= 0 ? (t.Deduped ? "yes" : "no") : "");
+                    item.SubItems.Add(blobs ? "" : (t.WordCount >= 0 ? (t.Deduped ? "yes" : "no") : ""));
                     item.SubItems.Add(t.SourceFile ?? "");
                     item.SubItems.Add(string.IsNullOrEmpty(t.ImportedUtc) ? "" : t.ImportedUtc.Replace("T", " ").Substring(0, Math.Min(19, t.ImportedUtc.Length)));
+                    item.Tag = t.Kind;
                     _tablesView.Items.Add(item);
                 }
             }
@@ -424,12 +442,90 @@ namespace wordlist2sql
             }
         }
 
+        // ---------------------------------------------------------- Import BLOBs
+
+        private async void OnImportBlobs(object sender, EventArgs e)
+        {
+            if (_db == null) return;
+
+            string[] files;
+            using (var dlg = new OpenFileDialog
+            {
+                Title = "Choose file(s) to store as BLOBs",
+                Filter = "All files (*.*)|*.*",
+                Multiselect = true,
+            })
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                files = dlg.FileNames;
+            }
+
+            string table = WordlistDb.SanitizeTableName(
+                Prompt("BLOB table", "Store the selected file(s) in table:", "blobs"));
+            if (table == null) return;
+
+            bool append = false;
+            if (_db.TableExists(table))
+            {
+                var ans = MessageBox.Show(this,
+                    $"Table \"{table}\" already exists.\n\n" +
+                    "Yes = add these files to it,  No = replace it,  Cancel = abort.",
+                    "Table exists", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                if (ans == DialogResult.Cancel) return;
+                append = ans == DialogResult.Yes;
+            }
+
+            _cts = new CancellationTokenSource();
+            SetBusy(true);
+            try
+            {
+                SetStatus($"Importing {files.Length} file(s) as BLOBs → \"{table}\"…");
+                Log($"BLOB import start: {files.Length} file(s) → \"{table}\" (append={append})");
+
+                var progress = new Progress<WordlistDb.BlobProgress>(p =>
+                {
+                    int pct = p.TotalFiles > 0 ? (int)((long)p.FilesDone * 100 / p.TotalFiles) : 0;
+                    _progress.Value = Math.Min(100, Math.Max(0, pct));
+                    SetStatus($"\"{table}\": {p.FilesDone}/{p.TotalFiles} files, {p.BytesDone:n0} bytes ({p.CurrentFile})");
+                });
+
+                var token = _cts.Token;
+                int n = await Task.Run(() => _db.ImportBlobs(table, files, append, progress, token), token);
+
+                Log($"BLOB import done: \"{table}\" — {n} file(s) stored.");
+                SetStatus($"Stored {n} file(s) as BLOBs in \"{table}\".");
+            }
+            catch (OperationCanceledException)
+            {
+                SetStatus("BLOB import cancelled.");
+                Log("BLOB import cancelled by user.");
+            }
+            catch (Exception ex)
+            {
+                Error("BLOB import failed", ex);
+            }
+            finally
+            {
+                _progress.Value = 0;
+                _cts?.Dispose();
+                _cts = null;
+                SetBusy(false);
+                RefreshTables();
+            }
+        }
+
         // ---------------------------------------------------------- Export
 
         private async void OnExport(object sender, EventArgs e)
         {
             string table = SelectedTable();
             if (table == null || _db == null) return;
+
+            if (SelectedIsBlobTable())
+            {
+                await ExportBlobsAsync(table);
+                return;
+            }
 
             string outPath;
             using (var dlg = new SaveFileDialog
@@ -472,6 +568,57 @@ namespace wordlist2sql
             catch (Exception ex)
             {
                 Error("Export failed", ex);
+            }
+            finally
+            {
+                _progress.Value = 0;
+                _cts?.Dispose();
+                _cts = null;
+                SetBusy(false);
+            }
+        }
+
+        private async Task ExportBlobsAsync(string table)
+        {
+            string folder;
+            using (var dlg = new FolderBrowserDialog
+            {
+                Description = $"Choose a folder to extract the BLOBs of \"{table}\" into",
+                UseDescriptionForTitle = true,
+            })
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                folder = dlg.SelectedPath;
+            }
+
+            _cts = new CancellationTokenSource();
+            SetBusy(true);
+            try
+            {
+                SetStatus($"Extracting BLOBs from \"{table}\"…");
+                Log($"BLOB export start: \"{table}\" → {folder}");
+
+                var progress = new Progress<WordlistDb.BlobProgress>(p =>
+                {
+                    int pct = p.TotalFiles > 0 ? (int)((long)p.FilesDone * 100 / p.TotalFiles) : 0;
+                    _progress.Value = Math.Min(100, Math.Max(0, pct));
+                    SetStatus($"Extracting \"{table}\": {p.FilesDone}/{p.TotalFiles} files ({p.CurrentFile})");
+                });
+
+                var token = _cts.Token;
+                int n = await Task.Run(() => _db.ExportBlobs(table, folder, progress, token), token);
+
+                SetStatus($"Extracted {n} file(s) to {folder}.");
+                Log($"BLOB export done: {n} file(s) → {folder}");
+            }
+            catch (OperationCanceledException)
+            {
+                SetStatus("BLOB export cancelled.");
+                Log("BLOB export cancelled by user.");
+            }
+            catch (Exception ex)
+            {
+                Error("BLOB export failed", ex);
             }
             finally
             {

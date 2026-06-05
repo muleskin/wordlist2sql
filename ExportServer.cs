@@ -197,6 +197,15 @@ namespace wordlist2sql
                     }
                 }
 
+                // This endpoint streams a one-word-per-line list, so the table
+                // must have a 'word' column. Blob tables don't.
+                if (!HasWordColumn(conn, table))
+                {
+                    WriteStatus(ctx, 400,
+                        $"'{table}' is not a word-list table (no 'word' column); cannot stream as text.\n");
+                    return;
+                }
+
                 ctx.Response.StatusCode = 200;
                 ctx.Response.ContentType = "text/plain; charset=utf-8";
                 ctx.Response.SendChunked = true;
@@ -239,6 +248,21 @@ namespace wordlist2sql
             ctx.Response.ContentLength64 = body.Length;
             ctx.Response.OutputStream.Write(body, 0, body.Length);
             ctx.Response.OutputStream.Close();
+        }
+
+        private static bool HasWordColumn(SQLiteConnection conn, string table)
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"PRAGMA table_info(\"{table.Replace("\"", "\"\"")}\");";
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                        if (string.Equals(r.GetString(1), "word", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                }
+            }
+            return false;
         }
 
         private SQLiteConnection OpenReadOnly()
