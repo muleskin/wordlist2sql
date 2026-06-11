@@ -227,27 +227,137 @@ namespace wordlist2sql
 
         private void ServeWords(HttpListenerContext ctx, SQLiteConnection conn, string table)
         {
-            ctx.Response.StatusCode = 200;
+            bool isHead = string.Equals(ctx.Request.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase);
+            string rangeHeader = ctx.Request.Headers["Range"];
+
             ctx.Response.ContentType = "text/plain; charset=utf-8";
-            ctx.Response.SendChunked = true;
+            ctx.Response.AddHeader("Accept-Ranges", "bytes");
             ctx.Response.AddHeader("Content-Disposition", $"attachment; filename=\"{table}.txt\"");
 
-            long written = 0;
-            using (var writer = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false), 1 << 20))
+            // The streamed length: UTF-8 bytes of each non-null word + one '\n'.
+            // Stable across requests (row order is fixed), which makes resume safe.
+            long total = WordTableByteLength(conn, table);
+
+            long start = 0, end = total - 1;
+            var range = ParseRange(rangeHeader, total);
+            if (range.Kind == RangeKind.Unsatisfiable)
+            {
+                ctx.Response.AddHeader("Content-Range", $"bytes */{total}");
+                WriteStatus(ctx, 416, $"requested range not satisfiable for '{table}' ({total} bytes).\n");
+                return;
+            }
+            if (range.Kind == RangeKind.Partial)
+            {
+                start = range.Start;
+                end = range.End;
+                ctx.Response.StatusCode = 206;
+                ctx.Response.AddHeader("Content-Range", $"bytes {start}-{end}/{total}");
+            }
+            else
+            {
+                ctx.Response.StatusCode = 200;
+            }
+
+            long partLength = (total == 0) ? 0 : (end - start + 1);
+            ctx.Response.ContentLength64 = partLength;
+
+            if (isHead)
+            {
+                Log?.Invoke($"{ctx.Request.RemoteEndPoint} HEAD /{table} -> {total:n0} bytes");
+                return;
+            }
+
+            // Walk rows, tracking the byte position, writing only the [start,end]
+            // slice. Boundary lines are partially written.
+            var nl = new byte[] { (byte)'\n' };
+            var outStream = ctx.Response.OutputStream;
+            long pos = 0;
+            long remaining = partLength;
+
+            using (var bufStream = new BufferedStream(outStream, 1 << 20))
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = $"SELECT word FROM {Quote(table)};";
                 using (var r = cmd.ExecuteReader())
                 {
-                    while (r.Read())
+                    while (r.Read() && remaining > 0)
                     {
-                        if (!r.IsDBNull(0))
-                            writer.WriteLine(r.GetString(0));
-                        written++;
+                        if (r.IsDBNull(0)) continue;
+
+                        byte[] wb = Encoding.UTF8.GetBytes(r.GetString(0));
+                        int lineLen = wb.Length + 1;          // + '\n'
+                        long lineStart = pos;
+                        long lineEnd = pos + lineLen;          // exclusive
+                        pos = lineEnd;
+
+                        if (lineEnd <= start) continue;        // entirely before range
+                        if (lineStart > end) break;            // past range
+
+                        // Intersect [lineStart,lineEnd) with [start,end].
+                        int from = (int)Math.Max(0, start - lineStart);
+                        int toExcl = (int)Math.Min(lineLen, end - lineStart + 1);
+
+                        if (from == 0 && toExcl == lineLen)
+                        {
+                            // Whole line in range (the common case): bulk write.
+                            bufStream.Write(wb, 0, wb.Length);
+                            bufStream.WriteByte((byte)'\n');
+                            remaining -= lineLen;
+                        }
+                        else
+                        {
+                            // Boundary line: write the word slice, then '\n' if included.
+                            int wEnd = Math.Min(toExcl, wb.Length);
+                            if (wEnd > from)
+                            {
+                                bufStream.Write(wb, from, wEnd - from);
+                                remaining -= (wEnd - from);
+                            }
+                            if (wb.Length >= from && wb.Length < toExcl) // newline byte in slice
+                            {
+                                bufStream.WriteByte((byte)'\n');
+                                remaining--;
+                            }
+                        }
                     }
                 }
             }
-            Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET /{table} -> {written:n0} words");
+
+            Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET /{table} -> " +
+                        (range.Kind == RangeKind.Partial
+                            ? $"bytes {start}-{end}/{total}"
+                            : $"{total:n0} bytes"));
+        }
+
+        /// <summary>
+        /// Total byte length of the streamed word list (UTF-8 word bytes + one
+        /// '\n' per non-null row). Read from metadata when available, else
+        /// computed with a single aggregate scan.
+        /// </summary>
+        private static long WordTableByteLength(SQLiteConnection conn, string table)
+        {
+            // Metadata is the fast path, but the table (or column) may be absent
+            // in a database created by another tool — fall through to a scan.
+            try
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT total_bytes FROM _wordlist_meta WHERE table_name=@t;";
+                    cmd.Parameters.AddWithValue("@t", table);
+                    object o = cmd.ExecuteScalar();
+                    if (o != null && o != DBNull.Value)
+                        return Convert.ToInt64(o);
+                }
+            }
+            catch (SQLiteException) { /* no meta table/column; compute below */ }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    $"SELECT COALESCE(SUM(length(CAST(word AS BLOB)) + 1), 0) " +
+                    $"FROM {Quote(table)} WHERE word IS NOT NULL;";
+                return Convert.ToInt64(cmd.ExecuteScalar());
+            }
         }
 
         /// <summary>
@@ -317,29 +427,66 @@ namespace wordlist2sql
 
                     string name = r.IsDBNull(0) ? table + ".bin" : r.GetString(0);
                     long len = r.IsDBNull(1) ? 0 : r.GetInt64(1);
+                    bool isHead = string.Equals(ctx.Request.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase);
 
-                    ctx.Response.StatusCode = 200;
                     ctx.Response.ContentType = ContentTypeFor(name);
-                    ctx.Response.ContentLength64 = len;
+                    ctx.Response.AddHeader("Accept-Ranges", "bytes");
                     ctx.Response.AddHeader("Content-Disposition",
                         $"attachment; filename=\"{SanitizeHeader(name)}\"");
 
-                    // Stream the BLOB column in chunks (no full-file buffering).
+                    // Resolve a Range header (single range) against the blob length.
+                    long start = 0, end = len - 1;
+                    var range = ParseRange(ctx.Request.Headers["Range"], len);
+                    if (range.Kind == RangeKind.Unsatisfiable)
+                    {
+                        ctx.Response.AddHeader("Content-Range", $"bytes */{len}");
+                        WriteStatus(ctx, 416, $"requested range not satisfiable for '{name}' ({len} bytes).\n");
+                        return;
+                    }
+                    if (range.Kind == RangeKind.Partial)
+                    {
+                        start = range.Start;
+                        end = range.End;
+                        ctx.Response.StatusCode = 206; // Partial Content
+                        ctx.Response.AddHeader("Content-Range", $"bytes {start}-{end}/{len}");
+                    }
+                    else
+                    {
+                        ctx.Response.StatusCode = 200;
+                    }
+
+                    long partLength = (len == 0) ? 0 : (end - start + 1);
+                    ctx.Response.ContentLength64 = partLength;
+
+                    if (isHead)
+                    {
+                        Log?.Invoke($"{ctx.Request.RemoteEndPoint} HEAD /{table}" +
+                                    (selector != null ? "/" + selector : "") +
+                                    $" -> '{name}' ({len:n0} bytes)");
+                        return; // headers only
+                    }
+
+                    // Stream the requested byte range in chunks (no full-file buffering).
                     var outStream = ctx.Response.OutputStream;
                     byte[] buffer = new byte[1 << 16];
-                    long offset = 0;
-                    while (true)
+                    long offset = start;
+                    long remaining = partLength;
+                    while (remaining > 0)
                     {
-                        long read = r.GetBytes(2, offset, buffer, 0, buffer.Length);
+                        int want = (int)Math.Min(buffer.Length, remaining);
+                        long read = r.GetBytes(2, offset, buffer, 0, want);
                         if (read <= 0) break;
                         outStream.Write(buffer, 0, (int)read);
                         offset += read;
-                        if (read < buffer.Length) break;
+                        remaining -= read;
                     }
 
                     Log?.Invoke($"{ctx.Request.RemoteEndPoint} GET /{table}" +
                                 (selector != null ? "/" + selector : "") +
-                                $" -> blob '{name}' ({offset:n0} bytes)");
+                                $" -> blob '{name}' " +
+                                (range.Kind == RangeKind.Partial
+                                    ? $"bytes {start}-{end}/{len}"
+                                    : $"({len:n0} bytes)"));
                 }
             }
         }
@@ -364,6 +511,73 @@ namespace wordlist2sql
                 }
             }
             WriteStatus(ctx, 200, sb.ToString());
+        }
+
+        private enum RangeKind { None, Partial, Unsatisfiable }
+
+        private struct RangeResult
+        {
+            public RangeKind Kind;
+            public long Start;
+            public long End;
+        }
+
+        /// <summary>
+        /// Parse a single HTTP byte-range header against a known content length.
+        /// Supports "bytes=start-end", "bytes=start-" and "bytes=-suffix".
+        /// Multiple ranges or anything unparseable is treated as no range (full).
+        /// </summary>
+        private static RangeResult ParseRange(string header, long length)
+        {
+            var none = new RangeResult { Kind = RangeKind.None };
+            if (string.IsNullOrWhiteSpace(header))
+                return none;
+
+            header = header.Trim();
+            const string prefix = "bytes=";
+            if (!header.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return none;
+
+            string spec = header.Substring(prefix.Length).Trim();
+            if (spec.Length == 0 || spec.IndexOf(',') >= 0)
+                return none; // multi-range not supported -> serve full
+
+            int dash = spec.IndexOf('-');
+            if (dash < 0)
+                return none;
+
+            string startText = spec.Substring(0, dash).Trim();
+            string endText = spec.Substring(dash + 1).Trim();
+
+            // Empty content: any range request is unsatisfiable.
+            if (length <= 0)
+                return new RangeResult { Kind = RangeKind.Unsatisfiable };
+
+            long start, end;
+            if (startText.Length == 0)
+            {
+                // Suffix range: "-N" => last N bytes.
+                if (!long.TryParse(endText, out long suffix) || suffix <= 0)
+                    return none;
+                if (suffix > length) suffix = length;
+                start = length - suffix;
+                end = length - 1;
+            }
+            else
+            {
+                if (!long.TryParse(startText, out start) || start < 0)
+                    return none;
+                if (endText.Length == 0)
+                    end = length - 1;                 // "start-" => to end
+                else if (!long.TryParse(endText, out end) || end < start)
+                    return none;
+                if (end > length - 1) end = length - 1; // clamp to available
+            }
+
+            if (start > length - 1)
+                return new RangeResult { Kind = RangeKind.Unsatisfiable };
+
+            return new RangeResult { Kind = RangeKind.Partial, Start = start, End = end };
         }
 
         private static string Quote(string ident) => "\"" + ident.Replace("\"", "\"\"") + "\"";

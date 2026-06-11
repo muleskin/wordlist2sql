@@ -80,6 +80,11 @@ namespace wordlist2sql
             // Migration: older databases lack the 'kind' column. Add it if missing.
             if (!MetaHasColumn("kind"))
                 Exec(_conn, $"ALTER TABLE \"{MetaTable}\" ADD COLUMN kind TEXT NOT NULL DEFAULT 'words';");
+
+            // Migration: total streamed byte length (UTF-8 word bytes + one '\n'
+            // per row). Nullable; the server computes it on demand when absent.
+            if (!MetaHasColumn("total_bytes"))
+                Exec(_conn, $"ALTER TABLE \"{MetaTable}\" ADD COLUMN total_bytes INTEGER;");
         }
 
         private bool MetaHasColumn(string column)
@@ -253,6 +258,7 @@ namespace wordlist2sql
 
             long inserted = 0;
             long lines = 0;
+            long wordBytes = 0; // UTF-8 bytes of stored words + 1 '\n' each
             var prog = new ImportProgress { TotalBytes = totalBytes };
 
             // 1 MiB read buffer over the raw file stream; StreamReader handles
@@ -283,7 +289,13 @@ namespace wordlist2sql
                             continue;
 
                         p.Value = word;
-                        inserted += cmd.ExecuteNonQuery();
+                        int affected = cmd.ExecuteNonQuery();
+                        if (affected > 0)
+                        {
+                            inserted += affected;
+                            // Matches the server's stream: word bytes + one '\n'.
+                            wordBytes += Encoding.UTF8.GetByteCount(word) + 1;
+                        }
                         sinceCommit++;
 
                         if (sinceCommit >= BatchSize)
@@ -317,7 +329,7 @@ namespace wordlist2sql
                 }
             }
 
-            UpsertMeta(tableName, inserted, filePath, dedupe, KindWords);
+            UpsertMeta(tableName, inserted, filePath, dedupe, KindWords, wordBytes);
 
             prog.BytesRead = totalBytes;
             prog.WordsInserted = inserted;
@@ -327,21 +339,22 @@ namespace wordlist2sql
             return new ImportResult { WordsInserted = inserted, LinesRead = lines, Deduped = dedupe };
         }
 
-        private void UpsertMeta(string tableName, long count, string sourceFile, bool dedupe, string kind)
+        private void UpsertMeta(string tableName, long count, string sourceFile, bool dedupe, string kind, long? totalBytes = null)
         {
             using (var cmd = _conn.CreateCommand())
             {
                 cmd.CommandText =
-                    $"INSERT INTO \"{MetaTable}\" (table_name, word_count, source_file, deduped, imported_utc, kind) " +
-                    "VALUES (@t, @c, @s, @d, @u, @k) " +
+                    $"INSERT INTO \"{MetaTable}\" (table_name, word_count, source_file, deduped, imported_utc, kind, total_bytes) " +
+                    "VALUES (@t, @c, @s, @d, @u, @k, @b) " +
                     "ON CONFLICT(table_name) DO UPDATE SET " +
-                    "word_count=@c, source_file=@s, deduped=@d, imported_utc=@u, kind=@k;";
+                    "word_count=@c, source_file=@s, deduped=@d, imported_utc=@u, kind=@k, total_bytes=@b;";
                 cmd.Parameters.AddWithValue("@t", tableName);
                 cmd.Parameters.AddWithValue("@c", count);
                 cmd.Parameters.AddWithValue("@s", sourceFile ?? "");
                 cmd.Parameters.AddWithValue("@d", dedupe ? 1 : 0);
                 cmd.Parameters.AddWithValue("@u", DateTime.UtcNow.ToString("o"));
                 cmd.Parameters.AddWithValue("@k", kind ?? KindWords);
+                cmd.Parameters.AddWithValue("@b", (object)totalBytes ?? DBNull.Value);
                 cmd.ExecuteNonQuery();
             }
         }

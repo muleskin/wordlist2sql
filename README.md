@@ -137,6 +137,20 @@ curl http://localhost:8088/assets/3        -o file3      # a blob by row id
 Blob responses carry the stored file name (`Content-Disposition`) and a guessed
 `Content-Type`, and stream in chunks so large files don't buffer in memory.
 
+**Resumable downloads.** Both word-list and blob responses advertise
+`Accept-Ranges: bytes`, honor HTTP `Range` requests (`206 Partial Content` with a
+`Content-Range` header; `416` if out of bounds), and support `HEAD`:
+
+```
+curl -C - http://localhost:8088/breach -o breach.txt        # resume a huge wordlist
+curl -C - http://localhost:8088/assets/big.zip -o big.zip   # resume a blob download
+curl -r 0-1023 http://localhost:8088/assets/big.zip -o head # just the first 1 KB
+```
+
+Word lists stream as UTF-8 with `\n` line endings; the byte length is recorded at
+import time (so ranges are answered instantly) and the row order is fixed, which
+makes resuming a multi-GB list safe and consistent across requests.
+
 ## Performance notes
 
 The database is opened with `journal_mode=OFF`, `synchronous=OFF`, and a large page
