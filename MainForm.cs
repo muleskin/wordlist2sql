@@ -13,6 +13,7 @@ namespace wordlist2sql
     {
         private WordlistDb _db;
         private ExportServer _server;
+        private string _serverBaseText = "";
         private CancellationTokenSource _cts;
 
         // --- Controls ---
@@ -730,9 +731,11 @@ namespace wordlist2sql
                 bool lan = _lanChk.Checked;
                 _server = new ExportServer(_db.DatabasePath, port, lan);
                 _server.Log += Log;
+                _serverBaseText = (lan ? "LAN" : "Local") + $" — running at {_server.BaseUrl}";
+                _server.ConnectionsChanged += OnConnectionsChanged;
                 _server.Start();
                 _serverBtn.Text = "Stop server";
-                _serverStatus.Text = (lan ? "LAN" : "Local") + $" — running at {_server.BaseUrl}";
+                _serverStatus.Text = _serverBaseText + "  ·  0 active";
                 _serverStatus.ForeColor = Color.ForestGreen;
                 _portBox.Enabled = false;
                 _lanChk.Enabled = false;
@@ -814,6 +817,7 @@ namespace wordlist2sql
         private void StopServerIfRunning()
         {
             if (_server == null) return;
+            try { _server.ConnectionsChanged -= OnConnectionsChanged; } catch { }
             try { _server.Stop(); } catch { }
             _server = null;
             _serverBtn.Text = "Start server";
@@ -821,6 +825,20 @@ namespace wordlist2sql
             _serverStatus.ForeColor = SystemColors.GrayText;
             _portBox.Enabled = true;
             _lanChk.Enabled = true;
+        }
+
+        // Live connection count from the server (fires on a pool thread).
+        private void OnConnectionsChanged(int active, long total, long peak)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)(() => OnConnectionsChanged(active, total, peak))); } catch { }
+                return;
+            }
+            if (_server == null) return;
+            _serverStatus.Text =
+                $"{_serverBaseText}  ·  {active} active  (peak {peak}, {total:n0} served)";
         }
 
         // ------------------------------------------------------------- misc

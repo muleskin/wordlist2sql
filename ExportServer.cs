@@ -17,6 +17,10 @@ namespace wordlist2sql
     /// </summary>
     public sealed class ExportServer : IDisposable
     {
+        // Per-response copy buffer. Large writes mean fewer http.sys/kernel
+        // transitions, which is the main lever for raw outbound throughput.
+        private const int StreamBufferSize = 1 << 20; // 1 MiB
+
         private readonly string _dbPath;
         private readonly int _port;
         private readonly bool _lanAccess;
@@ -24,8 +28,21 @@ namespace wordlist2sql
         private Thread _thread;
         private volatile bool _running;
 
+        // Live connection accounting.
+        private int _active;
+        private long _totalServed;
+        private long _peak;
+
         /// <summary>Raised (on a background thread) with a one-line log message.</summary>
         public event Action<string> Log;
+
+        /// <summary>
+        /// Raised when the active-connection count changes:
+        /// (activeNow, totalServedSoFar, peakConcurrent).
+        /// </summary>
+        public event Action<int, long, long> ConnectionsChanged;
+
+        public int ActiveConnections => Volatile.Read(ref _active);
 
         /// <summary>
         /// URL clients should use. For LAN mode this is the machine's primary
@@ -70,6 +87,15 @@ namespace wordlist2sql
                     ex);
             }
 
+            // Allow many simultaneous downloads (http.sys queues; we serve in
+            // parallel) and warm the pool so concurrent clients start instantly.
+            try
+            {
+                ThreadPool.GetMinThreads(out int w, out int io);
+                ThreadPool.SetMinThreads(Math.Max(w, 32), Math.Max(io, 32));
+            }
+            catch { /* best effort */ }
+
             _running = true;
             _thread = new Thread(Loop) { IsBackground = true, Name = "wordlist-http" };
             _thread.Start();
@@ -112,6 +138,8 @@ namespace wordlist2sql
 
         private void Loop()
         {
+            // One thread only accepts; each accepted request is handled on a
+            // pool thread so many clients download concurrently.
             while (_running)
             {
                 HttpListenerContext ctx;
@@ -125,9 +153,35 @@ namespace wordlist2sql
                     break;
                 }
 
-                try { Handle(ctx); }
-                catch (Exception ex) { Log?.Invoke("Request error: " + ex.Message); }
+                ThreadPool.QueueUserWorkItem(state => Serve((HttpListenerContext)state), ctx);
             }
+        }
+
+        private void Serve(HttpListenerContext ctx)
+        {
+            int now = Interlocked.Increment(ref _active);
+            Interlocked.Increment(ref _totalServed);
+            // Track the high-water mark of concurrent connections.
+            long peak;
+            do { peak = Interlocked.Read(ref _peak); }
+            while (now > peak && Interlocked.CompareExchange(ref _peak, now, peak) != peak);
+            RaiseConnections();
+
+            try { Handle(ctx); }
+            catch (Exception ex) { Log?.Invoke("Request error: " + ex.Message); }
+            finally
+            {
+                Interlocked.Decrement(ref _active);
+                RaiseConnections();
+            }
+        }
+
+        private void RaiseConnections()
+        {
+            ConnectionsChanged?.Invoke(
+                Volatile.Read(ref _active),
+                Interlocked.Read(ref _totalServed),
+                Interlocked.Read(ref _peak));
         }
 
         private void Handle(HttpListenerContext ctx)
@@ -274,7 +328,7 @@ namespace wordlist2sql
             long pos = 0;
             long remaining = partLength;
 
-            using (var bufStream = new BufferedStream(outStream, 1 << 20))
+            using (var bufStream = new BufferedStream(outStream, StreamBufferSize))
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = $"SELECT word FROM {Quote(table)};";
@@ -466,9 +520,10 @@ namespace wordlist2sql
                         return; // headers only
                     }
 
-                    // Stream the requested byte range in chunks (no full-file buffering).
+                    // Stream the requested byte range in large chunks (no
+                    // full-file buffering). Big writes minimize kernel transitions.
                     var outStream = ctx.Response.OutputStream;
-                    byte[] buffer = new byte[1 << 16];
+                    byte[] buffer = new byte[StreamBufferSize];
                     long offset = start;
                     long remaining = partLength;
                     while (remaining > 0)
@@ -652,6 +707,18 @@ namespace wordlist2sql
             };
             var conn = new SQLiteConnection(builder.ConnectionString);
             conn.Open();
+
+            // Read-tuned pragmas: memory-map the file and use a generous page
+            // cache so concurrent readers pull pages fast with few syscalls.
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "PRAGMA query_only=1;" +
+                    "PRAGMA mmap_size=1073741824;" + // up to 1 GiB mmapped
+                    "PRAGMA cache_size=-65536;" +    // 64 MiB page cache
+                    "PRAGMA temp_store=MEMORY;";
+                cmd.ExecuteNonQuery();
+            }
             return conn;
         }
 

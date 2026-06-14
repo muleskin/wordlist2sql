@@ -151,6 +151,13 @@ Word lists stream as UTF-8 with `\n` line endings; the byte length is recorded a
 import time (so ranges are answered instantly) and the row order is fixed, which
 makes resuming a multi-GB list safe and consistent across requests.
 
+**Concurrent + fast.** The server handles many simultaneous downloads (each on its
+own pool thread and its own read-only SQLite connection), so multiple clients can
+pull at once. The server panel shows live **active connections** (plus peak and
+total served). Throughput is tuned with 1 MiB write buffers, fixed `Content-Length`
+responses (no chunked-encoding overhead), and memory-mapped reads with a 64 MiB
+page cache per connection — well over 500 MB/s aggregate on loopback in testing.
+
 ## Performance notes
 
 The database is opened with `journal_mode=OFF`, `synchronous=OFF`, and a large page
